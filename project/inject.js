@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ActiveSG Booking Dashboard
 // @namespace    local.activesg.dashboard
-// @version      2.0.0
+// @version      2.2.0
 // @description  Read-only time × venue grid on ActiveSG after you log in. Never books anything.
 // @match        https://activesg.gov.sg/*
 // @grant        none
@@ -20,9 +20,12 @@
   window.__ASG_BOOKING_DASHBOARD__ = true;
 
   const ORIGIN = 'https://activesg.gov.sg';
-  const FANOUT = 3;
-  const CACHE_TTL_MS = 2 * 60 * 1000;
+  const FANOUT = 6;
+  const BATCH_SIZE = 8;
+  const CACHE_TTL_MS = 30 * 60 * 1000;
   const STORAGE_KEY = 'asg-dash-prefs';
+  const SLOT_CACHE_KEY = 'asg-dash-slot-cache';
+  const MIN_PANEL_WIDTH = 320;
 
   const ACTIVITY_LIST_PROBES = [
     ['activity.list', {}],
@@ -33,16 +36,8 @@
     ['activity.search', { search: '' }],
   ];
 
-  const SLOT_PROBES = [
-    'schedule.getAvailability',
-    'schedule.getSlots',
-    'schedule.listSlots',
-    'schedule.getByDate',
-    'booking.getAvailability',
-  ];
-
   const cache = new Map();
-  let slotProbe = null;
+  const dayCache = new Map();
   let lastRawSample = null;
 
   function todayStr() {
@@ -64,6 +59,68 @@
 
   function savePrefs(partial) {
     sessionStorage.setItem(STORAGE_KEY, JSON.stringify({ ...loadPrefs(), ...partial }));
+  }
+
+  function dayKey(activityId, date) {
+    return `${activityId}:${date}`;
+  }
+
+  function readPersistedDays() {
+    try {
+      return JSON.parse(sessionStorage.getItem(SLOT_CACHE_KEY) || '{}');
+    } catch {
+      return {};
+    }
+  }
+
+  function writePersistedDays(store) {
+    try {
+      sessionStorage.setItem(SLOT_CACHE_KEY, JSON.stringify(store));
+    } catch {
+      /* quota — in-memory cache still works */
+    }
+  }
+
+  function getCachedDay(activityId, date) {
+    const key = dayKey(activityId, date);
+    const mem = dayCache.get(key);
+    if (mem && Date.now() < mem.expiresAt) return mem.value;
+    const persisted = readPersistedDays()[key];
+    if (persisted && Date.now() < persisted.expiresAt) {
+      dayCache.set(key, persisted);
+      return persisted.value;
+    }
+    return null;
+  }
+
+  function putCachedDay(activityId, date, value, expiresAt) {
+    const key = dayKey(activityId, date);
+    const entry = { value, expiresAt };
+    dayCache.set(key, entry);
+    const store = readPersistedDays();
+    store[key] = entry;
+    writePersistedDays(store);
+  }
+
+  function cacheDaysFromVenues(activityId, perVenue, meta) {
+    const expiresAt = Date.now() + CACHE_TTL_MS;
+    for (const date of dateWindow()) {
+      putCachedDay(
+        activityId,
+        date,
+        {
+          activityId,
+          date,
+          generatedAt: meta.generatedAt,
+          cached: true,
+          venues: [],
+          grid: gridFromVenues(perVenue, date),
+          errors: meta.errors,
+          unparsed: meta.unparsed,
+        },
+        expiresAt
+      );
+    }
   }
 
   function unwrapTrpc(body) {
@@ -112,6 +169,32 @@
       throw new Error(`ActiveSG ${procedure} failed (HTTP ${res.status})`);
     }
     return unwrapTrpc(body);
+  }
+
+  async function trpcBatch(procedure, jsonInputs) {
+    if (jsonInputs.length === 1) return [await trpcGet(procedure, jsonInputs[0])];
+    const path = jsonInputs.map(() => procedure).join(',');
+    const input = {};
+    jsonInputs.forEach((json, i) => {
+      input[i] = { json };
+    });
+    const url = `${ORIGIN}/api/trpc/${path}?batch=1&input=${encodeURIComponent(JSON.stringify(input))}`;
+    const res = await fetch(url, {
+      credentials: 'include',
+      headers: { Accept: 'application/json' },
+    });
+    const text = await res.text();
+    if (text.trimStart().startsWith('<')) {
+      throw new Error('ActiveSG returned a security check page. Reload this tab, finish the check, and log in if asked.');
+    }
+    const body = JSON.parse(text);
+    const rows = Array.isArray(body)
+      ? body
+      : Object.keys(body)
+          .sort((a, b) => Number(a) - Number(b))
+          .map((k) => body[k]);
+    if (!res.ok) throw new Error(`ActiveSG ${procedure} batch failed (HTTP ${res.status})`);
+    return rows.map((row) => unwrapTrpc(row));
   }
 
   function asArray(value) {
@@ -192,10 +275,13 @@
   function asDateKey(value) {
     if (value == null || value === '') return null;
     if (typeof value === 'string') {
+      if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+      if (/T|\d{2}:\d{2}|GMT|Z|\+\d{2}/.test(value)) {
+        const parsed = new Date(value);
+        if (!Number.isNaN(parsed.getTime())) return formatDateSgt(parsed);
+      }
       const iso = value.match(/\d{4}-\d{2}-\d{2}/);
       if (iso) return iso[0];
-      const d = new Date(value);
-      if (!Number.isNaN(d.getTime())) return formatDateSgt(d);
       return null;
     }
     if (typeof value === 'number') {
@@ -257,19 +343,26 @@
     return false;
   }
 
-  function isAvailableSlot(node) {
+  function isBallotNode(node) {
     if (!node || typeof node !== 'object' || Array.isArray(node)) return false;
-    if (isExplicitlyUnavailable(node)) return false;
+    if (node.isBallot === true || node.ballot === true || node.isInstant === false) return true;
+    if (node.isInstant === true || node.instant === true) return false;
+    for (const key of ['type', 'slotType', 'bookingType', 'kind', 'mode', 'sessionType', 'availabilityType', 'category']) {
+      const value = String(node[key] || '').toLowerCase();
+      if (value.includes('ballot')) return true;
+    }
+    return false;
+  }
+
+  function isInstantSlot(node) {
+    if (!node || typeof node !== 'object' || Array.isArray(node)) return false;
+    if (isBallotNode(node) || isExplicitlyUnavailable(node)) return false;
     if (node.isAvailable === true || node.available === true || node.bookable === true) return true;
     if (node.is_available === 'Y' || node.isAvailable === 'Y') return true;
     const count = numericCount(node);
     if (count != null) return count > 0;
     const status = String(pick(node, ['status', 'availability', 'state']) || '').toUpperCase();
-    if (['AVAILABLE', 'OPEN', 'VACANT', 'FREE'].includes(status)) return true;
-    if (node.isBallot === true || node.ballot === true || String(node.type || '').toUpperCase() === 'BALLOT') {
-      return true;
-    }
-    // Availability payloads often list only free sessions, with a time and no flag.
+    if (['AVAILABLE', 'OPEN', 'VACANT', 'FREE', 'INSTANT'].includes(status)) return true;
     if (timeLabelFrom(node)) return true;
     return false;
   }
@@ -277,81 +370,111 @@
   function slotCount(node) {
     const n = numericCount(node);
     if (n != null) return n;
-    if (node.isBallot === true || node.ballot === true) return 1;
     return 1;
   }
 
-  function pickDateBranch(data, date) {
-    if (!data || typeof data !== 'object' || Array.isArray(data)) return data;
-    if (data[date] != null) return data[date];
-    for (const key of ['dates', 'days', 'byDate', 'availabilityByDate', 'slotsByDate']) {
-      const branch = data[key];
-      if (branch && typeof branch === 'object' && !Array.isArray(branch) && branch[date] != null) {
-        return branch[date];
-      }
-      if (Array.isArray(branch)) {
-        const match = branch.find((item) => asDateKey(item) === date);
-        if (match) return match;
-      }
-    }
-    return data;
+  function dateFromNode(node) {
+    if (!node || typeof node !== 'object') return null;
+    const direct = asDateKey(node);
+    if (direct) return direct;
+    return asDateKey(
+      pick(node, ['startTime', 'start', 'startsAt', 'startAt', 'timeFrom', 'datetime', 'startDate', 'slotDate', 'day'])
+    );
   }
 
-  function extractSlots(data, date) {
-    const scoped = pickDateBranch(data, date);
+  function datesOnNode(node) {
+    const dates = [];
+    const own = dateFromNode(node);
+    if (own) dates.push(own);
+    if (!node || typeof node !== 'object') return dates;
+    for (const key of ['availableDates', 'dates', 'days']) {
+      if (!Array.isArray(node[key])) continue;
+      for (const item of node[key]) {
+        const d = asDateKey(item) || dateFromNode(item);
+        if (d) dates.push(d);
+      }
+    }
+    return [...new Set(dates)];
+  }
+
+  function extractAllInstantSlots(data) {
     const found = [];
 
-    function visit(node, inheritedDate) {
+    function visit(node, inheritedDate, inheritedBallot) {
       if (node == null) return;
       if (Array.isArray(node)) {
-        node.forEach((child) => visit(child, inheritedDate));
+        node.forEach((child) => visit(child, inheritedDate, inheritedBallot));
         return;
       }
       if (typeof node !== 'object') return;
 
-      const nodeDate = asDateKey(node) || inheritedDate;
-      if (nodeDate && nodeDate !== date) {
-        for (const value of Object.values(node)) {
-          if (value && typeof value === 'object') visit(value, nodeDate);
-        }
+      const ballot = inheritedBallot || isBallotNode(node);
+      const ownDate = dateFromNode(node) || inheritedDate;
+
+      if (node.instantSlots != null || node.instant != null) {
+        visit(node.instantSlots ?? node.instant, ownDate, false);
         return;
       }
 
       const label = timeLabelFrom(node);
-      if (label && isAvailableSlot(node)) {
-        found.push({
-          label,
-          count: slotCount(node),
-          ballot: !!(node.isBallot || node.ballot),
-        });
+      if (label && !ballot && isInstantSlot(node)) {
+        const dates = datesOnNode(node);
+        if (inheritedDate) dates.push(inheritedDate);
+        for (const slotDate of [...new Set(dates)]) {
+          found.push({ date: slotDate, label, count: slotCount(node) });
+        }
         return;
       }
 
-      const nestedKeys = ['slots', 'timeslots', 'timeSlots', 'sessions', 'resources', 'courts', 'facilities', 'items'];
-      let walked = false;
+      let walkedDateKeys = false;
+      for (const [key, value] of Object.entries(node)) {
+        if (isBallotKey(key) || value == null || typeof value !== 'object') continue;
+        const keyDate = asDateKey(key);
+        if (keyDate) {
+          walkedDateKeys = true;
+          visit(value, keyDate, ballot);
+        }
+      }
+
+      const nestedKeys = ['slots', 'timeslots', 'timeSlots', 'sessions', 'resources', 'courts', 'facilities', 'items', 'dates', 'days'];
+      let walked = walkedDateKeys;
       for (const key of nestedKeys) {
-        if (node[key] != null) {
-          visit(node[key], nodeDate || inheritedDate);
+        if (node[key] != null && !isBallotKey(key) && !asDateKey(key)) {
+          visit(node[key], ownDate, ballot);
           walked = true;
         }
       }
-      if (walked) return;
+      if (walkedDateKeys || walked) {
+        for (const [key, value] of Object.entries(node)) {
+          if (isBallotKey(key) || asDateKey(key) || nestedKeys.includes(key)) continue;
+          if (value && typeof value === 'object') visit(value, ownDate, ballot);
+        }
+        return;
+      }
 
-      for (const value of Object.values(node)) {
-        if (value && typeof value === 'object') visit(value, nodeDate || inheritedDate);
+      for (const [key, value] of Object.entries(node)) {
+        if (isBallotKey(key)) continue;
+        if (value && typeof value === 'object') visit(value, ownDate, ballot);
       }
     }
 
-    visit(scoped, asDateKey(scoped) || date);
+    visit(data, null, isBallotNode(data));
+    return found;
+  }
 
+  function mergeSlotsForDate(allSlots, date) {
     const merged = new Map();
-    for (const slot of found) {
-      const prev = merged.get(slot.label) || { label: slot.label, count: 0, ballot: false };
+    for (const slot of allSlots) {
+      if (slot.date !== date) continue;
+      const prev = merged.get(slot.label) || { label: slot.label, count: 0 };
       prev.count += slot.count;
-      prev.ballot = prev.ballot || slot.ballot;
       merged.set(slot.label, prev);
     }
     return [...merged.values()];
+  }
+
+  function isBallotKey(key) {
+    return /ballot/i.test(String(key || ''));
   }
 
   function isAuthError(err) {
@@ -439,70 +562,136 @@
     return results;
   }
 
-  async function slotsForVenue(activityId, venue, date) {
+  async function slotsForVenue(activityId, venue) {
     const summary = await trpcGet('schedule.getAvailabilitySummary', {
       venueId: venue.id,
       activityId,
     });
     lastRawSample = lastRawSample || { venue: venue.name, procedure: 'schedule.getAvailabilitySummary', data: summary };
-    let slots = extractSlots(summary, date);
-    if (slots.length) return slots;
-
-    const probes = slotProbe ? [slotProbe] : SLOT_PROBES;
-    for (const procedure of probes) {
-      try {
-        const extra = await trpcGet(procedure, { venueId: venue.id, activityId, date });
-        lastRawSample = { venue: venue.name, procedure, data: extra };
-        slots = extractSlots(extra, date);
-        if (slots.length) {
-          slotProbe = procedure;
-          return slots;
-        }
-      } catch (err) {
-        if (isAuthError(err)) throw err;
-      }
-    }
-    return [];
+    return extractAllInstantSlots(summary);
   }
 
-  async function getAvailability(activityId, date) {
-    const cacheKey = `${activityId}:${date}`;
-    const hit = cache.get(cacheKey);
-    if (hit && Date.now() < hit.expiresAt) return { ...hit.value, cached: true };
+  async function fetchVenueSummaries(venues, activityId, onProgress) {
+    const results = new Array(venues.length);
+    for (let i = 0; i < venues.length; i += BATCH_SIZE) {
+      const chunk = venues.slice(i, i + BATCH_SIZE);
+      try {
+        const payloads = await trpcBatch(
+          'schedule.getAvailabilitySummary',
+          chunk.map((venue) => ({ venueId: venue.id, activityId }))
+        );
+        chunk.forEach((venue, j) => {
+          const summary = payloads[j];
+          lastRawSample = lastRawSample || { venue: venue.name, procedure: 'schedule.getAvailabilitySummary', data: summary };
+          results[i + j] = {
+            venue: venue.name,
+            venueId: venue.id,
+            slots: extractAllInstantSlots(summary),
+            error: null,
+          };
+        });
+      } catch {
+        const nested = await mapWithConcurrency(chunk, FANOUT, async (venue) => {
+          try {
+            const slots = await slotsForVenue(activityId, venue);
+            return { venue: venue.name, venueId: venue.id, slots, error: null };
+          } catch (err) {
+            return { venue: venue.name, venueId: venue.id, slots: [], error: err.message };
+          }
+        });
+        nested.forEach((row, j) => {
+          results[i + j] = row;
+        });
+      }
+      onProgress?.(Math.min(i + chunk.length, venues.length), venues.length);
+    }
+    return results;
+  }
+
+  function gridFromVenues(perVenue, date) {
+    const grid = {};
+    for (const row of perVenue) {
+      const slots = mergeSlotsForDate(row.slots, date);
+      if (!slots.length) continue;
+      for (const slot of slots) {
+        grid[slot.label] ??= {};
+        grid[slot.label][row.venue] ??= { count: 0, venueId: row.venueId };
+        grid[slot.label][row.venue].count += slot.count;
+      }
+    }
+    return grid;
+  }
+
+  async function getAvailability(activityId, date, onProgress) {
+    const cachedDay = getCachedDay(activityId, date);
+    if (cachedDay) return cachedDay;
+
+    const hit = cache.get(activityId);
+    if (hit && Date.now() < hit.expiresAt) {
+      const value = {
+        activityId,
+        date,
+        generatedAt: hit.generatedAt,
+        cached: true,
+        venues: [],
+        grid: gridFromVenues(hit.perVenue, date),
+        errors: hit.errors,
+        unparsed: hit.unparsed,
+      };
+      putCachedDay(activityId, date, value, hit.expiresAt);
+      return value;
+    }
 
     lastRawSample = null;
     const venues = await getVenues(activityId);
-    const perVenue = await mapWithConcurrency(venues, FANOUT, async (venue) => {
-      try {
-        const slots = await slotsForVenue(activityId, venue, date);
-        return { venue: venue.name, venueId: venue.id, slots, error: null };
-      } catch (err) {
-        return { venue: venue.name, venueId: venue.id, slots: [], error: err.message };
-      }
-    });
-
-    const grid = {};
-    for (const row of perVenue) {
-      for (const slot of row.slots) {
-        grid[slot.label] ??= {};
-        grid[slot.label][row.venue] ??= { count: 0, venueId: row.venueId, ballot: false };
-        grid[slot.label][row.venue].count += slot.count;
-        grid[slot.label][row.venue].ballot = grid[slot.label][row.venue].ballot || slot.ballot;
-      }
-    }
-
-    const value = {
+    const perVenue = await fetchVenueSummaries(venues, activityId, onProgress);
+    const errors = perVenue.filter((v) => v.error).map((v) => ({ venue: v.venue, error: v.error }));
+    const unparsed = perVenue.every((v) => v.slots.length === 0) && lastRawSample;
+    const generatedAt = new Date().toISOString();
+    const expiresAt = Date.now() + CACHE_TTL_MS;
+    cache.set(activityId, { perVenue, errors, unparsed, generatedAt, expiresAt });
+    cacheDaysFromVenues(activityId, perVenue, { generatedAt, errors, unparsed });
+    const warm = getCachedDay(activityId, date);
+    return warm ? { ...warm, cached: false } : {
       activityId,
       date,
-      generatedAt: new Date().toISOString(),
-      venues: perVenue.map((v) => v.venue),
-      venueIds: Object.fromEntries(perVenue.map((v) => [v.venue, v.venueId])),
-      grid,
-      errors: perVenue.filter((v) => v.error).map((v) => ({ venue: v.venue, error: v.error })),
-      unparsed: perVenue.every((v) => v.slots.length === 0) && lastRawSample,
+      generatedAt,
+      cached: false,
+      venues: [],
+      grid: gridFromVenues(perVenue, date),
+      errors,
+      unparsed,
     };
-    cache.set(cacheKey, { value, expiresAt: Date.now() + CACHE_TTL_MS });
-    return { ...value, cached: false };
+  }
+
+  function addDaysIso(iso, days) {
+    const date = new Date(`${iso}T12:00:00+08:00`);
+    date.setDate(date.getDate() + days);
+    return formatDateSgt(date);
+  }
+
+  function dateWindow() {
+    const start = todayStr();
+    return Array.from({ length: 15 }, (_, i) => addDaysIso(start, i));
+  }
+
+  function dateCardParts(iso) {
+    const date = new Date(`${iso}T12:00:00+08:00`);
+    return {
+      dow: date.toLocaleDateString('en-SG', { weekday: 'short', timeZone: 'Asia/Singapore' }),
+      rest: date.toLocaleDateString('en-SG', { day: 'numeric', month: 'short', timeZone: 'Asia/Singapore' }),
+    };
+  }
+
+  function displayTime(label) {
+    const start = String(label).split(' - ')[0].trim();
+    const hm = start.match(/(\d{1,2}):(\d{2})/);
+    if (!hm) return label;
+    let hour = Number(hm[1]);
+    const minute = hm[2];
+    const ampm = hour >= 12 ? 'pm' : 'am';
+    hour = hour % 12 || 12;
+    return `${hour}:${minute} ${ampm}`;
   }
 
   function bookingUrl(activityId, venueId, date) {
@@ -516,49 +705,78 @@
     return url.toString();
   }
 
-  function heatColor(count) {
-    if (count <= 0) return 'transparent';
-    if (count === 1) return '#fde68a';
-    if (count <= 3) return '#86efac';
-    return '#22c55e';
-  }
-
   const CSS = `
     :host { all: initial; }
-    .wrap { font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; color: #1a1a1a; }
+    .wrap { font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; color: #111; }
     .toggle {
       position: fixed; top: 88px; right: 0; z-index: 2147483646;
-      border: 0; border-radius: 8px 0 0 8px; background: #2563eb; color: #fff;
-      padding: 10px 12px; font-size: 13px; cursor: pointer; box-shadow: 0 2px 8px rgb(0 0 0 / 20%);
+      border: 0; border-radius: 10px 0 0 10px; background: #111; color: #fff;
+      padding: 10px 14px; font-size: 13px; font-weight: 600; cursor: pointer;
     }
     .panel {
       position: fixed; top: 0; right: 0; z-index: 2147483645;
-      width: min(92vw, 1100px); height: 100vh; background: #fff;
-      box-shadow: -8px 0 24px rgb(0 0 0 / 18%);
+      width: 560px; max-width: 92vw; min-width: 320px; height: 100vh; background: #fff;
+      box-shadow: -12px 0 32px rgb(0 0 0 / 12%);
       display: flex; flex-direction: column; transform: translateX(100%);
       transition: transform 160ms ease;
     }
     .panel.open { transform: translateX(0); }
-    .header { padding: 16px 18px 10px; border-bottom: 1px solid #eee; }
-    .header h1 { font-size: 16px; margin: 0 0 4px; }
-    .sub { font-size: 12px; color: #666; margin: 0; }
-    .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; padding: 12px 18px; }
-    .controls label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: #555; }
-    select, input[type='date'] { padding: 6px 8px; border-radius: 6px; border: 1px solid #ccc; font-size: 13px; }
-    button.run { padding: 8px 14px; border: 0; border-radius: 6px; background: #2563eb; color: #fff; cursor: pointer; }
-    button.run:disabled { opacity: 0.6; cursor: default; }
-    .updated { font-size: 12px; color: #777; margin-left: auto; align-self: center; }
-    .body { flex: 1; overflow: auto; padding: 0 18px 18px; }
-    .error { color: #dc2626; font-size: 13px; }
-    .warn { color: #b45309; font-size: 13px; }
-    .empty { color: #777; font-size: 13px; }
-    table { border-collapse: collapse; width: 100%; font-size: 12px; }
-    th, td { border: 1px solid #e5e5e5; padding: 7px 8px; text-align: center; }
-    th { background: #f5f5f5; position: sticky; top: 0; z-index: 1; }
-    .time { white-space: nowrap; font-weight: 600; background: #fafafa; text-align: left; }
-    .clickable { cursor: pointer; }
-    .clickable:hover { outline: 2px solid #2563eb; }
-    details { margin-top: 12px; font-size: 12px; color: #555; }
+    .panel.dragging { transition: none; user-select: none; }
+    .resizer {
+      position: absolute; left: 0; top: 0; bottom: 0; width: 10px; cursor: ew-resize;
+      z-index: 3;
+    }
+    .resizer::after {
+      content: ''; position: absolute; left: 3px; top: 50%; transform: translateY(-50%);
+      width: 3px; height: 48px; border-radius: 99px; background: #d4d4d4;
+    }
+    .chrome { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+    .top { padding: 20px 20px 0; }
+    .instant {
+      display: inline-flex; align-items: center; gap: 8px;
+      background: #111; color: #fff; border-radius: 999px; padding: 8px 14px 8px 10px;
+      font-weight: 700; font-size: 15px;
+    }
+    .instant svg { display: block; }
+    .sport-row { margin: 16px 0 0; }
+    .sport-row label { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: #666; }
+    select {
+      appearance: none; background: #fff; border: 1px solid #e5e5e5; border-radius: 12px;
+      padding: 10px 12px; font-size: 14px; color: #111;
+    }
+    .dates {
+      display: flex; gap: 10px; overflow-x: auto; padding: 16px 20px 8px;
+      scrollbar-width: thin;
+    }
+    .date-card {
+      flex: 0 0 86px; height: 86px; border: 1px solid #e8e8e8; border-radius: 16px;
+      background: #fff; cursor: pointer; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 4px; color: #111;
+    }
+    .date-card .dow { font-weight: 700; font-size: 16px; }
+    .date-card .rest { font-size: 13px; color: #555; }
+    .date-card.selected { border: 3px solid #111; background: #fafafa; }
+    .hint { margin: 8px 20px 0; color: #6b6b6b; font-size: 14px; }
+    .meta { margin: 4px 20px 0; font-size: 12px; color: #999; }
+    .body { flex: 1; overflow: auto; padding: 16px 20px 24px; display: flex; flex-direction: column; gap: 12px; }
+    .error { color: #b91c1c; font-size: 14px; margin: 0; }
+    .warn { color: #92400e; font-size: 13px; margin: 0; }
+    .empty { color: #6b6b6b; font-size: 14px; margin: 0; }
+    .slot {
+      border: 1px solid #e8e8e8; border-radius: 16px; padding: 14px 16px; background: #fff;
+    }
+    .slot-time {
+      text-align: center; font-size: 18px; font-weight: 600; padding: 4px 0 12px; color: #111;
+    }
+    .venues { display: flex; flex-direction: column; gap: 8px; }
+    .venue {
+      border: 1px solid #e8e8e8; border-radius: 12px; background: #fff; cursor: pointer;
+      padding: 10px 12px; display: flex; justify-content: space-between; align-items: center;
+      font-size: 14px; color: #111; text-align: left; width: 100%;
+    }
+    .venue:hover { border-color: #111; }
+    .venue .count { color: #666; font-size: 13px; }
+    details { font-size: 12px; color: #555; }
     pre { background: #f6f6f6; padding: 8px; overflow: auto; max-height: 240px; font-size: 11px; }
   `;
 
@@ -577,31 +795,96 @@
 
     const panel = document.createElement('div');
     panel.className = 'panel';
-    panel.innerHTML = `
-      <div class="header">
-        <h1>ActiveSG Booking Dashboard</h1>
-        <p class="sub">Read-only grid across every venue. Click a cell to open ActiveSG's own booking page. Nothing is booked for you.</p>
+    const resizer = document.createElement('div');
+    resizer.className = 'resizer';
+    resizer.title = 'Drag to resize';
+    panel.appendChild(resizer);
+    const chrome = document.createElement('div');
+    chrome.className = 'chrome';
+    chrome.innerHTML = `
+      <div class="top">
+        <div class="instant">
+          <svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="12" cy="12" r="10" fill="none" stroke="white" stroke-width="1.8"/>
+            <path d="M13 4.5L7.5 13h4.2L11 19.5 16.5 11h-4.2L13 4.5z" fill="white"/>
+          </svg>
+          Instant
+        </div>
+        <div class="sport-row">
+          <label>Sport<select id="sport"></select></label>
+        </div>
       </div>
-      <div class="controls">
-        <label>Sport<select id="sport"></select></label>
-        <label>Date<input id="date" type="date" /></label>
-        <button class="run" id="refresh" type="button">Load grid</button>
-        <span class="updated" id="updated"></span>
-      </div>
-      <div class="body" id="body"><p class="empty">Log into ActiveSG if you have not already, pick a sport and date, then load the grid.</p></div>
+      <div class="dates" id="dates"></div>
+      <p class="hint">Each slot is 1 hour long. Instant booking only.</p>
+      <p class="meta" id="updated"></p>
+      <div class="body" id="body"><p class="empty">Log into ActiveSG, then pick a day.</p></div>
     `;
+    panel.appendChild(chrome);
 
     wrap.append(toggle, panel);
     shadow.append(style, wrap);
     document.documentElement.appendChild(host);
 
     const sportEl = panel.querySelector('#sport');
-    const dateEl = panel.querySelector('#date');
-    const refreshEl = panel.querySelector('#refresh');
+    const datesEl = panel.querySelector('#dates');
     const updatedEl = panel.querySelector('#updated');
     const bodyEl = panel.querySelector('#body');
     const prefs = loadPrefs();
-    dateEl.value = prefs.date || todayStr();
+    const days = dateWindow();
+    let selectedDate = days.includes(prefs.date) ? prefs.date : days[0];
+    let loading = false;
+    let loadToken = 0;
+
+    function applyWidth(px) {
+      const max = Math.floor(window.innerWidth * 0.92);
+      const width = Math.min(max, Math.max(MIN_PANEL_WIDTH, Math.round(px)));
+      panel.style.width = `${width}px`;
+      return width;
+    }
+    applyWidth(Number(prefs.width) || 560);
+
+    resizer.addEventListener('pointerdown', (event) => {
+      event.preventDefault();
+      panel.classList.add('dragging');
+      resizer.setPointerCapture(event.pointerId);
+      const onMove = (move) => {
+        applyWidth(window.innerWidth - move.clientX);
+      };
+      const onUp = (up) => {
+        resizer.releasePointerCapture(up.pointerId);
+        resizer.removeEventListener('pointermove', onMove);
+        resizer.removeEventListener('pointerup', onUp);
+        panel.classList.remove('dragging');
+        savePrefs({ width: panel.getBoundingClientRect().width });
+      };
+      resizer.addEventListener('pointermove', onMove);
+      resizer.addEventListener('pointerup', onUp);
+    });
+
+    function renderDateCards() {
+      datesEl.replaceChildren();
+      for (const iso of days) {
+        const parts = dateCardParts(iso);
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'date-card' + (iso === selectedDate ? ' selected' : '');
+        const dow = document.createElement('span');
+        dow.className = 'dow';
+        dow.textContent = parts.dow;
+        const rest = document.createElement('span');
+        rest.className = 'rest';
+        rest.textContent = parts.rest;
+        btn.append(dow, rest);
+        btn.addEventListener('click', () => {
+          if (iso === selectedDate) return;
+          selectedDate = iso;
+          savePrefs({ date: iso });
+          renderDateCards();
+          loadDay();
+        });
+        datesEl.appendChild(btn);
+      }
+    }
 
     toggle.addEventListener('click', () => {
       panel.classList.toggle('open');
@@ -621,52 +904,53 @@
         }
         const preferred = prefs.sport && sports.some((s) => s.id === prefs.sport) ? prefs.sport : sports[0]?.id;
         if (preferred) sportEl.value = preferred;
-        bodyEl.replaceChildren(
-          p('empty', 'Pick a date and click Load grid. Requests go through this logged-in ActiveSG tab, a few venues at a time.')
-        );
+        renderDateCards();
+        await loadDay();
       } catch (err) {
+        renderDateCards();
         bodyEl.replaceChildren(p('error', humanError(err)));
       }
     }
 
-    async function loadGrid() {
+    async function loadDay() {
       const sport = sportEl.value;
-      const date = dateEl.value;
-      if (!sport || !date) return;
-      savePrefs({ sport, date });
-      refreshEl.disabled = true;
-      refreshEl.textContent = 'Loading…';
-      bodyEl.replaceChildren(p('empty', 'Fetching venues, then availability (max 3 at a time)…'));
+      if (!sport || !selectedDate) return;
+      savePrefs({ sport, date: selectedDate });
+      const token = ++loadToken;
+      loading = true;
+      const already = getCachedDay(sport, selectedDate);
+      if (!already) bodyEl.replaceChildren(p('empty', 'Finding instant slots…'));
       try {
-        const data = await getAvailability(sport, date);
-        renderGrid(data, sport, date);
+        const data = await getAvailability(sport, selectedDate, (done, total) => {
+          if (token !== loadToken || already) return;
+          bodyEl.replaceChildren(p('empty', `Loading venues ${done} of ${total}…`));
+        });
+        if (token !== loadToken) return;
+        renderSlots(data, sport, selectedDate);
         const time = new Date(data.generatedAt).toLocaleTimeString();
-        updatedEl.textContent = `Updated ${time}${data.cached ? ' (cached)' : ''}`;
+        updatedEl.textContent = data.cached ? `Updated ${time} (cached)` : `Updated ${time}`;
       } catch (err) {
+        if (token !== loadToken) return;
         bodyEl.replaceChildren(p('error', humanError(err)));
       } finally {
-        refreshEl.disabled = false;
-        refreshEl.textContent = 'Load grid';
+        if (token === loadToken) loading = false;
       }
     }
 
-    function renderGrid(data, activityId, date) {
+    function renderSlots(data, activityId, date) {
       const frag = document.createDocumentFragment();
       const times = Object.keys(data.grid).sort();
 
       if (data.errors.length) {
-        frag.appendChild(
-          p('warn', `Some venues failed to load: ${data.errors.map((e) => e.venue).join(', ')}`)
-        );
+        frag.appendChild(p('warn', `Some venues failed to load: ${data.errors.map((e) => e.venue).join(', ')}`));
       }
 
       if (times.length === 0) {
-        frag.appendChild(p('empty', 'No available slots found for this sport and date — or the API shape could not be parsed.'));
+        frag.appendChild(p('empty', 'No instant booking slots at any venue on this day.'));
         if (data.unparsed) {
           const details = document.createElement('details');
-          details.open = true;
           const summary = document.createElement('summary');
-          summary.textContent = 'Raw API sample (paste this back if the grid is empty)';
+          summary.textContent = 'Raw API sample (paste this back if this looks wrong)';
           const pre = document.createElement('pre');
           pre.textContent = JSON.stringify(data.unparsed, null, 2);
           details.append(summary, pre);
@@ -676,52 +960,39 @@
         return;
       }
 
-      const table = document.createElement('table');
-      const thead = document.createElement('thead');
-      const headRow = document.createElement('tr');
-      headRow.appendChild(th('Time', 'time'));
-      for (const venue of data.venues) headRow.appendChild(th(venue));
-      thead.appendChild(headRow);
-      const tbody = document.createElement('tbody');
       for (const time of times) {
-        const tr = document.createElement('tr');
-        tr.appendChild(td(time, 'time'));
-        for (const venue of data.venues) {
-          const cell = data.grid[time]?.[venue];
-          const count = cell?.count ?? 0;
-          const tdEl = td(count > 0 ? String(count) : '', count > 0 ? 'clickable' : '');
-          tdEl.style.background = heatColor(count);
-          tdEl.title = count > 0 ? 'Open ActiveSG booking for this venue' : 'No courts available';
-          if (count > 0 && cell) {
-            tdEl.addEventListener('click', () => {
-              window.open(bookingUrl(activityId, cell.venueId, date), '_blank', 'noopener,noreferrer');
-            });
-          }
-          tr.appendChild(tdEl);
+        const venues = Object.entries(data.grid[time]).filter(([, cell]) => cell.count > 0);
+        if (!venues.length) continue;
+        const card = document.createElement('div');
+        card.className = 'slot';
+        const heading = document.createElement('div');
+        heading.className = 'slot-time';
+        heading.textContent = displayTime(time);
+        const list = document.createElement('div');
+        list.className = 'venues';
+        for (const [venue, cell] of venues.sort((a, b) => a[0].localeCompare(b[0]))) {
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'venue';
+          const name = document.createElement('span');
+          name.textContent = venue;
+          const count = document.createElement('span');
+          count.className = 'count';
+          count.textContent = cell.count === 1 ? '1 court' : `${cell.count} courts`;
+          btn.append(name, count);
+          btn.addEventListener('click', () => {
+            window.open(bookingUrl(activityId, cell.venueId, date), '_blank', 'noopener,noreferrer');
+          });
+          list.appendChild(btn);
         }
-        tbody.appendChild(tr);
+        card.append(heading, list);
+        frag.appendChild(card);
       }
-      table.append(thead, tbody);
-      frag.appendChild(table);
       bodyEl.replaceChildren(frag);
     }
 
-    refreshEl.addEventListener('click', loadGrid);
+    sportEl.addEventListener('change', loadDay);
     fillSports();
-  }
-
-  function th(text, className) {
-    const n = document.createElement('th');
-    if (className) n.className = className;
-    n.textContent = text;
-    return n;
-  }
-
-  function td(text, className) {
-    const n = document.createElement('td');
-    if (className) n.className = className;
-    n.textContent = text;
-    return n;
   }
 
   function p(className, text) {
@@ -732,7 +1003,7 @@
   }
 
   function humanError(err) {
-    if (isAuthError(err)) return 'ActiveSG says you are not logged in. Sign in on this tab, then click Load grid.';
+    if (isAuthError(err)) return 'ActiveSG says you are not logged in. Sign in on this tab, then pick a day.';
     return err.message || String(err);
   }
 
