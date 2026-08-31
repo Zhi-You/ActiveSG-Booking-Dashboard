@@ -16,16 +16,24 @@ async function login() {
     throw new Error('ACTIVESG_EMAIL / ACTIVESG_PASSWORD are not set in .env');
   }
 
-  const res = await fetch(`${BASE}/v2/account/account_login`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      login_type: 'normal',
-      user_name: email,
-      password,
-      platform: 'android',
-    }),
-  });
+  let res;
+  try {
+    res = await fetch(`${BASE}/v2/account/account_login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        login_type: 'normal',
+        user_name: email,
+        password,
+        platform: 'android',
+      }),
+    });
+  } catch (e) {
+    const cause = e.cause?.code || e.message;
+    throw new Error(
+      `Cannot reach the old ActiveSG API at ${BASE} (${cause}). That host no longer accepts connections — see README.`
+    );
+  }
 
   if (!res.ok) {
     throw new Error(`ActiveSG login request failed with HTTP ${res.status}`);

@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "ActiveSG Booking Dashboard",
+  "version": "2.0.0",
+  "description": "Personal read-only time × venue grid on ActiveSG after you log in. Never books anything.",
+  "host_permissions": ["https://activesg.gov.sg/*"],
+  "content_scripts": [
+    {
+      "matches": ["https://activesg.gov.sg/*"],
+      "js": ["inject.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
