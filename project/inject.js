@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ActiveSG Booking Dashboard
 // @namespace    local.activesg.dashboard
-// @version      2.5.0
+// @version      2.6.1
 // @description  Read-only time × venue grid on ActiveSG after you log in. Never books anything.
 // @match        https://activesg.gov.sg/*
 // @grant        none
@@ -24,8 +24,8 @@
   const BATCH_SIZE = 16;
   const CACHE_TTL_MS = 30 * 60 * 1000;
   const STORAGE_KEY = 'asg-dash-prefs';
-  const SLOT_CACHE_KEY = 'asg-dash-slot-cache-v6';
-  const SUMMARY_PROC = 'schedule.getAvailabilitySummary';
+  const SLOT_CACHE_KEY = 'asg-dash-slot-cache-v8';
+  const DASH_HEADER = { Accept: 'application/json', 'x-asg-dash': '1' };
   const MIN_PANEL_WIDTH = 320;
 
   const ACTIVITY_LIST_PROBES = [
@@ -37,32 +37,44 @@
     ['activity.search', { search: '' }],
   ];
 
-  const DATE_SLOT_PROBES = [
+  const SLOT_PROCEDURES = [
+    'schedule.getAvailabilitySummary',
+    'schedule.getTimeslots',
+    'schedule.getAvailableTimeslots',
+    'schedule.listTimeslots',
+    'schedule.getInstantTimeslots',
+    'schedule.getInstantAvailability',
     'schedule.getAvailability',
     'schedule.getSlots',
-    'schedule.getInstantAvailability',
     'schedule.listSlots',
     'schedule.getByDate',
-    'schedule.list',
+    'timeslot.list',
+    'timeslot.getAvailable',
+    'booking.getTimeslots',
+    'booking.getAvailableTimeslots',
     'booking.getAvailability',
   ];
 
-  const dayCache = new Map();
   const venueCache = new Map();
-  const summaryCache = new Map();
+  const dayCache = new Map();
+  const slotSourceByActivity = new Map();
   const discoveredProcs = new Set();
-  let dateSlotProcedure = null;
-  let slotFetchMode = null;
-  let slotFetchActivityId = null;
-  let lastRawSample = null;
+  const officialCalls = [];
+  let lastDebug = null;
 
   window.addEventListener('asg-trpc', (event) => {
-    const url = event.detail?.url || '';
+    const detail = event.detail || {};
+    const url = detail.url || '';
     const match = String(url).match(/\/api\/trpc\/([^?]+)/);
-    if (!match) return;
-    for (const proc of match[1].split(',')) {
-      if (proc) discoveredProcs.add(proc);
-    }
+    const procs = match ? match[1].split(',').filter(Boolean) : [];
+    for (const proc of procs) discoveredProcs.add(proc);
+    const inputs = Array.isArray(detail.inputs) ? detail.inputs : [];
+    inputs.forEach((input, i) => {
+      const procedure = procs[i] || procs[0];
+      if (!procedure || !input || typeof input !== 'object') return;
+      officialCalls.push({ procedure, input });
+      if (officialCalls.length > 80) officialCalls.shift();
+    });
   });
 
   function todayStr() {
@@ -109,9 +121,9 @@
   function getCachedDay(activityId, date) {
     const key = dayKey(activityId, date);
     const mem = dayCache.get(key);
-    if (mem && Date.now() < mem.expiresAt) return mem.value;
+    if (mem && Date.now() < mem.expiresAt && mem.value?.date === date) return mem.value;
     const persisted = readPersistedDays()[key];
-    if (persisted && Date.now() < persisted.expiresAt) {
+    if (persisted && Date.now() < persisted.expiresAt && persisted.value?.date === date) {
       dayCache.set(key, persisted);
       return persisted.value;
     }
@@ -133,10 +145,7 @@
     const store = readPersistedDays();
     delete store[key];
     writePersistedDays(store);
-    const prefix = `${activityId}:`;
-    for (const cacheKey of [...summaryCache.keys()]) {
-      if (cacheKey.startsWith(prefix)) summaryCache.delete(cacheKey);
-    }
+    slotSourceByActivity.delete(activityId);
   }
 
   function unwrapTrpc(body) {
@@ -162,7 +171,7 @@
     const url = `${ORIGIN}/api/trpc/${procedure}?input=${encodeURIComponent(JSON.stringify(payload))}`;
     const res = await fetch(url, {
       credentials: 'include',
-      headers: { Accept: 'application/json' },
+      headers: DASH_HEADER,
     });
     const text = await res.text();
     if (text.trimStart().startsWith('<')) {
@@ -197,7 +206,7 @@
     const url = `${ORIGIN}/api/trpc/${path}?batch=1&input=${encodeURIComponent(JSON.stringify(input))}`;
     const res = await fetch(url, {
       credentials: 'include',
-      headers: { Accept: 'application/json' },
+      headers: DASH_HEADER,
     });
     const text = await res.text();
     if (text.trimStart().startsWith('<')) {
@@ -372,13 +381,42 @@
   }
 
   function isExplicitlyUnavailable(node) {
+    if (!node || typeof node !== 'object') return false;
     const status = String(pick(node, ['status', 'availability', 'state', 'bookingStatus']) || '').toUpperCase();
-    if (['UNAVAILABLE', 'FULL', 'BOOKED', 'CLOSED', 'NONE', 'SOLD_OUT'].includes(status)) return true;
+    if (
+      ['UNAVAILABLE', 'FULL', 'BOOKED', 'CLOSED', 'NONE', 'SOLD_OUT', 'OCCUPIED', 'DISABLED', 'NOT_AVAILABLE'].includes(
+        status
+      )
+    ) {
+      return true;
+    }
     if (node.isAvailable === false || node.available === false || node.bookable === false) return true;
+    if (node.isBookable === false || node.instantAvailable === false || node.isInstantAvailable === false) return true;
     if (node.is_available === 'N' || node.isAvailable === 'N') return true;
+    if (node.booked === true || node.isFull === true || node.isClosed === true) return true;
     const count = numericCount(node);
     if (count === 0) return true;
     return false;
+  }
+
+  function hasAvailabilityFlag(node) {
+    if (!node || typeof node !== 'object' || Array.isArray(node)) return false;
+    return (
+      node.isAvailable != null ||
+      node.available != null ||
+      node.bookable != null ||
+      node.isBookable != null ||
+      node.instantAvailable != null ||
+      node.isInstantAvailable != null ||
+      node.is_available != null ||
+      node.availableCount != null ||
+      node.availableSlots != null ||
+      node.vacancy != null ||
+      node.remaining != null ||
+      node.remainingSlots != null ||
+      node.slotsAvailable != null ||
+      node.freeCount != null
+    );
   }
 
   function isBallotNode(node) {
@@ -392,17 +430,18 @@
     return false;
   }
 
-  function isInstantSlot(node) {
+  function isInstantSlot(node, requireFlag) {
     if (!node || typeof node !== 'object' || Array.isArray(node)) return false;
     if (isBallotNode(node) || isExplicitlyUnavailable(node)) return false;
     if (node.isAvailable === true || node.available === true || node.bookable === true) return true;
+    if (node.isBookable === true || node.instantAvailable === true || node.isInstantAvailable === true) return true;
     if (node.is_available === 'Y' || node.isAvailable === 'Y') return true;
     const count = numericCount(node);
     if (count != null) return count > 0;
     const status = String(pick(node, ['status', 'availability', 'state']) || '').toUpperCase();
     if (['AVAILABLE', 'OPEN', 'VACANT', 'FREE', 'INSTANT'].includes(status)) return true;
-    if (timeLabelFrom(node)) return true;
-    return false;
+    if (requireFlag) return false;
+    return Boolean(timeLabelFrom(node));
   }
 
   function slotCount(node) {
@@ -420,19 +459,12 @@
     );
   }
 
-  function datesOnNode(node) {
-    const dates = [];
+  function slotDateOf(node, inheritedDate, assumeDate) {
     const own = dateFromNode(node);
-    if (own) dates.push(own);
-    if (!node || typeof node !== 'object') return dates;
-    for (const key of ['availableDates', 'dates', 'days']) {
-      if (!Array.isArray(node[key])) continue;
-      for (const item of node[key]) {
-        const d = asDateKey(item) || dateFromNode(item);
-        if (d) dates.push(d);
-      }
-    }
-    return [...new Set(dates)];
+    if (own) return { date: own, fromAssume: false };
+    if (inheritedDate) return { date: inheritedDate, fromAssume: false };
+    if (assumeDate) return { date: assumeDate, fromAssume: true };
+    return { date: null, fromAssume: false };
   }
 
   const NESTED_SLOT_KEYS = [
@@ -459,22 +491,43 @@
     'instantAvailability',
   ];
 
-  function looksLikeTimeLabel(value) {
-    return typeof value === 'string' && (/^\d{1,2}:\d{2}/.test(value) || /\d{1,2}\s*(am|pm)/i.test(value));
+  function payloadRequiresAvailabilityFlag(data) {
+    let found = false;
+    const seen = new Set();
+    function walk(node) {
+      if (found || node == null || seen.has(node)) return;
+      if (typeof node !== 'object') return;
+      seen.add(node);
+      if (hasAvailabilityFlag(node)) {
+        found = true;
+        return;
+      }
+      if (Array.isArray(node)) {
+        node.slice(0, 40).forEach(walk);
+        return;
+      }
+      for (const value of Object.values(node).slice(0, 40)) walk(value);
+    }
+    walk(data);
+    return found;
   }
 
   function extractAllInstantSlots(data, assumeDate) {
     const found = [];
+    const requireFlag = payloadRequiresAvailabilityFlag(data);
 
-    function pushSlot(slotDate, label, count) {
-      if (!slotDate || !label) return;
-      found.push({ date: slotDate, label, count: count || 1 });
+    function pushSlot(slotDate, label, count, fromAssume) {
+      if (!slotDate || !label || !count) return;
+      found.push({ date: slotDate, label, count, fromAssume: Boolean(fromAssume) });
     }
 
     function visit(node, inheritedDate, inheritedBallot) {
       if (node == null) return;
       if (typeof node === 'string') {
-        if (looksLikeTimeLabel(node)) pushSlot(inheritedDate || assumeDate, formatHm(node) || node, 1);
+        if (looksLikeTimeLabel(node) && !requireFlag) {
+          const resolved = slotDateOf({}, inheritedDate, assumeDate);
+          pushSlot(resolved.date, formatHm(node) || node, 1, resolved.fromAssume);
+        }
         return;
       }
       if (Array.isArray(node)) {
@@ -488,11 +541,9 @@
       const hasNested = NESTED_SLOT_KEYS.some((key) => node[key] != null && typeof node[key] === 'object');
 
       const label = timeLabelFrom(node);
-      if (label && !ballot && isInstantSlot(node) && !hasNested) {
-        const dates = datesOnNode(node);
-        if (inheritedDate) dates.push(inheritedDate);
-        if (!dates.length && assumeDate) dates.push(assumeDate);
-        for (const slotDate of [...new Set(dates)]) pushSlot(slotDate, label, slotCount(node));
+      if (label && !ballot && isInstantSlot(node, requireFlag) && !hasNested) {
+        const resolved = slotDateOf(node, inheritedDate, assumeDate);
+        pushSlot(resolved.date, label, slotCount(node), resolved.fromAssume);
       }
 
       if (node.instantSlots != null || node.instant != null) {
@@ -512,10 +563,14 @@
         if (keyTime && !ballot) {
           walked = true;
           if (typeof value === 'number' || typeof value === 'boolean') {
-            if (value) pushSlot(ownDate || assumeDate, keyTime, typeof value === 'number' ? value : 1);
+            if (value) {
+              const resolved = slotDateOf({}, ownDate, assumeDate);
+              pushSlot(resolved.date, keyTime, typeof value === 'number' ? value : 1, resolved.fromAssume);
+            }
           } else if (value && typeof value === 'object') {
-            if (!timeLabelFrom(value) && isInstantSlot({ ...value, startTime: keyTime })) {
-              pushSlot(dateFromNode(value) || ownDate || assumeDate, keyTime, slotCount(value));
+            if (!timeLabelFrom(value) && isInstantSlot({ ...value, startTime: keyTime }, requireFlag)) {
+              const resolved = slotDateOf(value, ownDate, assumeDate);
+              pushSlot(resolved.date, keyTime, slotCount(value), resolved.fromAssume);
             }
             visit(value, ownDate, ballot);
           }
@@ -543,8 +598,15 @@
       }
     }
 
-    visit(data, assumeDate || null, isBallotNode(data));
-    return found;
+    visit(data, null, isBallotNode(data));
+    if (!assumeDate) return found.filter((slot) => !slot.fromAssume);
+    const hasExplicit = found.some((slot) => !slot.fromAssume);
+    if (hasExplicit) return found.filter((slot) => slot.date === assumeDate && !slot.fromAssume);
+    return found.filter((slot) => slot.date === assumeDate);
+  }
+
+  function looksLikeTimeLabel(value) {
+    return typeof value === 'string' && (/^\d{1,2}:\d{2}/.test(value) || /\d{1,2}\s*(am|pm)/i.test(value));
   }
 
   function mergeSlotsForDate(allSlots, date) {
@@ -755,304 +817,310 @@
     return results;
   }
 
-  function resetSlotFetchIfNeeded(activityId) {
-    if (slotFetchActivityId === activityId) return;
-    slotFetchActivityId = activityId;
-    dateSlotProcedure = null;
-    slotFetchMode = null;
+  function clipJson(value, depth) {
+    if (depth == null) depth = 0;
+    if (value == null || typeof value !== 'object') return value;
+    if (depth > 4) return '[…]';
+    if (Array.isArray(value)) return value.slice(0, 8).map((item) => clipJson(item, depth + 1));
+    const out = {};
+    for (const [key, item] of Object.entries(value).slice(0, 24)) {
+      out[key] = clipJson(item, depth + 1);
+    }
+    return out;
   }
 
-  function summaryKey(activityId, venueId) {
-    return `${activityId}:${venueId}`;
+  function isUselessSlotProcedure(procedure) {
+    return /limit|count|quota|capacity|pass\.|activity\.|venue\.list/i.test(procedure);
   }
 
-  function getCachedSummary(activityId, venueId) {
-    const hit = summaryCache.get(summaryKey(activityId, venueId));
-    if (hit && Date.now() < hit.expiresAt) return hit.slots;
+  function inputHasDate(json) {
+    if (!json || typeof json !== 'object') return false;
+    return Object.entries(json).some(([key, value]) => {
+      if (/date|start|end|from|to|day/i.test(key) && value != null && value !== '') return true;
+      if (value && typeof value === 'object') return inputHasDate(value);
+      return false;
+    });
+  }
+
+  function inputHasVenue(json) {
+    return Boolean(json && (json.venueId != null || json.venue_id != null));
+  }
+
+  function officialCallDigest() {
+    const seen = new Set();
+    const out = [];
+    for (const call of officialCalls) {
+      const key = `${call.procedure}:${Object.keys(call.input).sort().join(',')}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ procedure: call.procedure, inputKeys: Object.keys(call.input) });
+    }
+    return out;
+  }
+
+  function classifyPayload(data, date) {
+    if (data == null) return { kind: 'empty', slots: [] };
+    if (typeof data !== 'object') return { kind: 'scalar', slots: [], preview: data };
+    const keys = Array.isArray(data) ? [] : Object.keys(data);
+    const badgeish =
+      !Array.isArray(data) &&
+      ('ballotAvailability' in data || 'nextInstantTimeslot' in data) &&
+      keys.length <= 8 &&
+      data.slots == null &&
+      data.timeslots == null &&
+      data.timeSlots == null &&
+      data.dates == null &&
+      data.days == null &&
+      !Array.isArray(data.availability);
+    if (badgeish) return { kind: 'badge', slots: [], preview: clipJson(data) };
+    if (Array.isArray(data) && data.length === 0) return { kind: 'empty-list', slots: [] };
+    const slots = extractAllInstantSlots(data, date);
+    const anyDated = extractAllInstantSlots(data, null);
+    if (slots.length || anyDated.length) return { kind: 'slots', slots, preview: clipJson(data) };
+    if (Array.isArray(data)) return { kind: 'empty-list', slots: [], preview: clipJson(data.slice(0, 4)) };
+    return { kind: 'unknown', slots: [], preview: clipJson(data) };
+  }
+
+  function slotInputBuilders() {
+    return [
+      (venue, activityId, date) => ({ venueId: venue.id, activityId, date }),
+      (venue, activityId, date) => ({ venueId: venue.id, activityId, startDate: date, endDate: date }),
+      (venue, activityId, date) => ({
+        venueId: venue.id,
+        activityId,
+        startTime: `${date}T00:00:00.000+08:00`,
+        endTime: `${date}T23:59:59.999+08:00`,
+      }),
+      (venue, activityId, date) => ({
+        venueId: venue.id,
+        activityId,
+        start: `${date}T00:00:00.000+08:00`,
+        end: `${addDaysIso(date, 1)}T00:00:00.000+08:00`,
+      }),
+    ];
+  }
+
+  function adaptOfficialInput(template, venue, activityId, date) {
+    const json = JSON.parse(JSON.stringify(template));
+    function walk(node) {
+      if (!node || typeof node !== 'object') return;
+      for (const [key, value] of Object.entries(node)) {
+        const k = key.toLowerCase();
+        if (k === 'venueid' || k === 'venue_id') node[key] = venue.id;
+        else if (k === 'activityid' || k === 'activity_id') node[key] = activityId;
+        else if (
+          typeof value === 'string' &&
+          /\d{4}-\d{2}-\d{2}/.test(value) &&
+          /date|start|end|from|to|day/i.test(key)
+        ) {
+          node[key] = value.replace(/\d{4}-\d{2}-\d{2}/, date);
+        } else if (value && typeof value === 'object') walk(value);
+      }
+    }
+    walk(json);
+    if (json.activityId == null) json.activityId = activityId;
+    if (inputHasVenue(template)) json.venueId = venue.id;
+    return json;
+  }
+
+  async function trySlotCall(procedure, json, date) {
+    const data = await trpcGet(procedure, json);
+    return { data, ...classifyPayload(data, date) };
+  }
+
+  function noteProbe(debug, row) {
+    debug.probes.push(row);
+    if (debug.probes.length > 48) debug.probes.splice(0, debug.probes.length - 48);
+  }
+
+  async function findSlotSource(venues, activityId, date, debug) {
+    const cached = slotSourceByActivity.get(activityId);
+    if (cached) return cached;
+
+    const probeVenues = venues.slice(0, 3);
+    const official = [];
+    const seenOfficial = new Set();
+    for (let i = officialCalls.length - 1; i >= 0; i--) {
+      const call = officialCalls[i];
+      if (isUselessSlotProcedure(call.procedure)) continue;
+      if (call.procedure.includes('Summary') && !inputHasDate(call.input)) continue;
+      if (!inputHasDate(call.input) && !/timeslot|getSlots|listSlots/i.test(call.procedure)) continue;
+      const key = `${call.procedure}:${Object.keys(call.input).sort().join(',')}`;
+      if (seenOfficial.has(key)) continue;
+      seenOfficial.add(key);
+      official.push(call);
+      if (official.length >= 8) break;
+    }
+    debug.officialSlotCandidates = official.map((call) => ({
+      procedure: call.procedure,
+      inputKeys: Object.keys(call.input),
+    }));
+
+    function rememberSource(source, venue, result) {
+      debug.chosen = {
+        procedure: source.procedure,
+        venue: venue.name,
+        kind: result.kind,
+        slotCount: result.slots.length,
+      };
+      if (debug.samples.length < 3) {
+        debug.samples.push({
+          venue: venue.name,
+          procedure: source.procedure,
+          kind: result.kind,
+          data: result.preview != null ? result.preview : clipJson(result.data),
+        });
+      }
+      slotSourceByActivity.set(activityId, source);
+    }
+
+    for (const call of official) {
+      for (const venue of probeVenues) {
+        try {
+          const result = await trySlotCall(call.procedure, adaptOfficialInput(call.input, venue, activityId, date), date);
+          noteProbe(debug, {
+            procedure: call.procedure,
+            venue: venue.name,
+            kind: result.kind,
+            slotCount: result.slots.length,
+          });
+          if (result.kind === 'slots') {
+            const source = {
+              procedure: call.procedure,
+              buildInput: (v, a, d) => adaptOfficialInput(call.input, v, a, d),
+            };
+            rememberSource(source, venue, result);
+            return source;
+          }
+        } catch (err) {
+          if (isAuthError(err)) throw err;
+          noteProbe(debug, { procedure: call.procedure, venue: venue.name, kind: 'error', error: err.message });
+        }
+      }
+    }
+
+    const procedures = [];
+    const seenProc = new Set();
+    for (const proc of [...discoveredProcs, ...SLOT_PROCEDURES]) {
+      if (!proc || isUselessSlotProcedure(proc) || seenProc.has(proc)) continue;
+      if (!/schedule\.|timeslot|slot|availability|booking\./i.test(proc)) continue;
+      seenProc.add(proc);
+      procedures.push(proc);
+    }
+
+    for (const buildInput of slotInputBuilders()) {
+      const venue = probeVenues[0];
+      const rows = await mapWithConcurrency(procedures, FANOUT, async (procedure) => {
+        try {
+          return { procedure, result: await trySlotCall(procedure, buildInput(venue, activityId, date), date) };
+        } catch (err) {
+          if (isAuthError(err)) throw err;
+          return { procedure, result: { kind: 'error', slots: [], error: err.message } };
+        }
+      });
+      for (const row of rows) {
+        noteProbe(debug, {
+          procedure: row.procedure,
+          venue: venue.name,
+          kind: row.result.kind,
+          slotCount: row.result.slots.length,
+          error: row.result.error,
+        });
+        if (row.result.kind === 'slots') {
+          const source = { procedure: row.procedure, buildInput };
+          rememberSource(source, venue, row.result);
+          return source;
+        }
+      }
+    }
+
+    for (const venue of probeVenues.slice(1)) {
+      const buildInput = slotInputBuilders()[0];
+      const rows = await mapWithConcurrency(procedures, FANOUT, async (procedure) => {
+        try {
+          return { procedure, result: await trySlotCall(procedure, buildInput(venue, activityId, date), date) };
+        } catch (err) {
+          if (isAuthError(err)) throw err;
+          return { procedure, result: { kind: 'error', slots: [], error: err.message } };
+        }
+      });
+      for (const row of rows) {
+        noteProbe(debug, {
+          procedure: row.procedure,
+          venue: venue.name,
+          kind: row.result.kind,
+          slotCount: row.result.slots.length,
+          error: row.result.error,
+        });
+        if (row.result.kind === 'slots') {
+          const source = { procedure: row.procedure, buildInput };
+          rememberSource(source, venue, row.result);
+          return source;
+        }
+      }
+    }
+
+    const badge = debug.probes.find((row) => row.kind === 'badge' || row.kind === 'scalar');
+    if (badge && debug.samples.length === 0) debug.samples.push(badge);
     return null;
   }
 
-  function putCachedSummary(activityId, venueId, slots) {
-    summaryCache.set(summaryKey(activityId, venueId), {
-      expiresAt: Date.now() + CACHE_TTL_MS,
-      slots,
-    });
-  }
-
-  function slotsOnDate(allSlots, date) {
-    return mergeSlotsForDate(allSlots, date).map((slot) => ({ ...slot, date }));
-  }
-
-  function dateSlotProbes() {
-    const probes = [];
-    for (const proc of discoveredProcs) {
-      if (/schedule\.|slot\.|booking\./i.test(proc) && !/summary|listByActivity|activity\.|venue\./i.test(proc)) {
-        probes.push(proc);
-      }
-    }
-    if (dateSlotProcedure) probes.unshift(dateSlotProcedure);
-    probes.push(...DATE_SLOT_PROBES);
-    const seen = new Set();
-    return probes.filter((proc) => {
-      if (seen.has(proc)) return false;
-      seen.add(proc);
-      return true;
-    });
-  }
-
-  async function fetchPaged(procedure, baseJson) {
-    const pages = [];
-    let data = await trpcGet(procedure, baseJson);
-    pages.push(data);
-    const seen = new Set();
-    for (let i = 0; i < 20; i++) {
-      const meta = pageMeta(data);
-      const cursor = meta.nextCursor;
-      const cursorKey = cursor != null && cursor !== '' ? String(cursor) : '';
-      if (!cursorKey || seen.has(cursorKey) || meta.hasNextPage === false) break;
-      if (!meta.items.length && meta.hasNextPage !== true) break;
-      seen.add(cursorKey);
-      data = await trpcGet(procedure, { ...baseJson, cursor, limit: 100 });
-      pages.push(data);
-    }
-    return pages;
-  }
-
-  function slotsFromDatePayloads(pages, date) {
-    const found = [];
-    for (const page of pages) {
-      found.push(...extractAllInstantSlots(page, date));
-    }
-    return slotsOnDate(found, date);
-  }
-
-  function rememberSample(venue, procedure, data) {
-    lastRawSample = lastRawSample || { venue: venue.name, procedure, data };
-  }
-
-  async function chooseFetchMode(activityId, venue, date) {
-    if (slotFetchMode) return slotFetchMode;
-
-    const probeRows = await mapWithConcurrency(dateSlotProbes(), FANOUT, async (procedure) => {
-      try {
-        const data = await trpcGet(procedure, { venueId: venue.id, activityId, date });
-        rememberSample(venue, procedure, data);
-        return { procedure, slots: slotsFromDatePayloads([data], date) };
-      } catch (err) {
-        if (isAuthError(err)) throw err;
-        return null;
-      }
-    });
-
-    let bestProc = null;
-    let bestSlots = [];
-    for (const row of probeRows) {
-      if (row && row.slots.length > bestSlots.length) {
-        bestProc = row.procedure;
-        bestSlots = row.slots;
-      }
-    }
-
-    let summarySlots = [];
-    const cachedSummary = getCachedSummary(activityId, venue.id);
-    if (cachedSummary) {
-      summarySlots = slotsOnDate(cachedSummary, date);
-    } else {
-      try {
-        const data = await trpcGet(SUMMARY_PROC, { venueId: venue.id, activityId });
-        rememberSample(venue, SUMMARY_PROC, data);
-        const all = extractAllInstantSlots(data);
-        putCachedSummary(activityId, venue.id, all);
-        summarySlots = slotsOnDate(all, date);
-      } catch (err) {
-        if (isAuthError(err)) throw err;
-      }
-    }
-
-    if (bestProc && bestSlots.length >= summarySlots.length && bestSlots.length > 0) {
-      dateSlotProcedure = bestProc;
-      slotFetchMode = 'date';
-      return slotFetchMode;
-    }
-    if (summarySlots.length > bestSlots.length) {
-      dateSlotProcedure = null;
-      slotFetchMode = 'summary';
-      return slotFetchMode;
-    }
-    if (bestProc) {
-      dateSlotProcedure = bestProc;
-      slotFetchMode = 'date';
-      return slotFetchMode;
-    }
-    slotFetchMode = 'summary';
-    return slotFetchMode;
-  }
-
-  async function dateSlotsForVenue(activityId, venue, date) {
-    const procedure = dateSlotProcedure;
-    if (!procedure) return [];
-    const pages = await fetchPaged(procedure, { venueId: venue.id, activityId, date });
-    rememberSample(venue, procedure, pages[0]);
-    return slotsFromDatePayloads(pages, date);
-  }
-
-  async function summarySlotsForVenue(activityId, venue, date) {
-    const cached = getCachedSummary(activityId, venue.id);
-    if (cached) return slotsOnDate(cached, date);
-    const data = await trpcGet(SUMMARY_PROC, { venueId: venue.id, activityId });
-    rememberSample(venue, SUMMARY_PROC, data);
-    const all = extractAllInstantSlots(data);
-    putCachedSummary(activityId, venue.id, all);
-    return slotsOnDate(all, date);
-  }
-
-  async function fetchChunk(procedure, inputs, mapRow) {
-    try {
-      const payloads = await trpcBatch(procedure, inputs);
-      return payloads.map((data, i) => mapRow(data, i, null));
-    } catch (err) {
-      if (isAuthError(err)) throw err;
-      return mapWithConcurrency(inputs, FANOUT, async (input, i) => {
-        try {
-          const data = await trpcGet(procedure, input);
-          return mapRow(data, i, null);
-        } catch (inner) {
-          return mapRow(null, i, inner);
-        }
-      });
-    }
-  }
-
   async function fetchSlotsForDate(venues, activityId, date, onProgress) {
+    const debug = {
+      venueCount: venues.length,
+      officialCalls: officialCallDigest(),
+      officialSlotCandidates: [],
+      probes: [],
+      samples: [],
+      chosen: null,
+    };
+    lastDebug = debug;
     if (!venues.length) return [];
-    await chooseFetchMode(activityId, venues[0], date);
+
+    const source = await findSlotSource(venues, activityId, date, debug);
+    if (!source) return venues.map((venue) => ({ venue: venue.name, venueId: venue.id, slots: [], error: null }));
+
     const results = new Array(venues.length);
-
-    if (slotFetchMode === 'date' && dateSlotProcedure) {
-      for (let i = 0; i < venues.length; i += BATCH_SIZE) {
-        const chunk = venues.slice(i, i + BATCH_SIZE);
-        const rows = await fetchChunk(
-          dateSlotProcedure,
-          chunk.map((venue) => ({ venueId: venue.id, activityId, date })),
-          (data, j, err) => {
-            const venue = chunk[j];
-            if (err) return { venue: venue.name, venueId: venue.id, slots: [], error: err.message };
-            rememberSample(venue, dateSlotProcedure, data);
-            return { venue: venue.name, venueId: venue.id, data, error: null };
-          }
-        );
-        await mapWithConcurrency(rows, FANOUT, async (row, j) => {
-          const venue = chunk[j];
-          if (row.error) {
-            try {
-              results[i + j] = {
-                venue: venue.name,
-                venueId: venue.id,
-                slots: await dateSlotsForVenue(activityId, venue, date),
-                error: null,
-              };
-            } catch (err) {
-              results[i + j] = { venue: venue.name, venueId: venue.id, slots: [], error: err.message };
-            }
-            return;
-          }
-          const meta = pageMeta(row.data);
-          let slots;
-          if (meta.nextCursor || meta.hasNextPage === true) {
-            slots = await dateSlotsForVenue(activityId, venue, date);
-          } else {
-            slots = slotsFromDatePayloads([row.data], date);
-          }
-          results[i + j] = { venue: venue.name, venueId: venue.id, slots, error: null };
-        });
-        onProgress?.(Math.min(i + chunk.length, venues.length), venues.length);
-      }
-      return results;
-    }
-
     for (let i = 0; i < venues.length; i += BATCH_SIZE) {
       const chunk = venues.slice(i, i + BATCH_SIZE);
-      const pending = [];
-      chunk.forEach((venue, j) => {
-        const cached = getCachedSummary(activityId, venue.id);
-        if (cached) {
-          results[i + j] = { venue: venue.name, venueId: venue.id, slots: slotsOnDate(cached, date), error: null };
-        } else {
-          pending.push({ venue, j });
-        }
-      });
-      if (pending.length) {
-        const rows = await fetchChunk(
-          SUMMARY_PROC,
-          pending.map(({ venue }) => ({ venueId: venue.id, activityId })),
-          (data, idx, err) => {
-            const venue = pending[idx].venue;
-            if (err) return { venue, error: err, data: null };
-            rememberSample(venue, SUMMARY_PROC, data);
-            return { venue, error: null, data };
-          }
+      try {
+        const payloads = await trpcBatch(
+          source.procedure,
+          chunk.map((venue) => source.buildInput(venue, activityId, date))
         );
-        for (let idx = 0; idx < pending.length; idx++) {
-          const { venue, j } = pending[idx];
-          const row = rows[idx];
-          if (row.error) {
-            try {
-              results[i + j] = {
-                venue: venue.name,
-                venueId: venue.id,
-                slots: await summarySlotsForVenue(activityId, venue, date),
-                error: null,
-              };
-            } catch (err) {
-              results[i + j] = { venue: venue.name, venueId: venue.id, slots: [], error: err.message };
-            }
-            continue;
+        chunk.forEach((venue, j) => {
+          const classified = classifyPayload(payloads[j], date);
+          if (classified.kind === 'slots' && debug.samples.length < 2) {
+            debug.samples.push({
+              venue: venue.name,
+              procedure: source.procedure,
+              kind: classified.kind,
+              data: classified.preview,
+            });
           }
-          const all = extractAllInstantSlots(row.data);
-          putCachedSummary(activityId, venue.id, all);
-          results[i + j] = { venue: venue.name, venueId: venue.id, slots: slotsOnDate(all, date), error: null };
-        }
+          results[i + j] = { venue: venue.name, venueId: venue.id, slots: classified.slots, error: null };
+        });
+      } catch (err) {
+        if (isAuthError(err)) throw err;
+        await mapWithConcurrency(chunk, FANOUT, async (venue, j) => {
+          try {
+            const data = await trpcGet(source.procedure, source.buildInput(venue, activityId, date));
+            const classified = classifyPayload(data, date);
+            results[i + j] = { venue: venue.name, venueId: venue.id, slots: classified.slots, error: null };
+          } catch (inner) {
+            results[i + j] = { venue: venue.name, venueId: venue.id, slots: [], error: inner.message };
+          }
+        });
       }
       onProgress?.(Math.min(i + chunk.length, venues.length), venues.length);
     }
     return results;
   }
 
-  function warmOtherDaysFromSummary(activityId, date, venues) {
-    if (slotFetchMode !== 'summary') return;
-    const expiresAt = Date.now() + CACHE_TTL_MS;
-    const generatedAt = new Date().toISOString();
-    for (const other of dateWindow()) {
-      if (other === date || getCachedDay(activityId, other)) continue;
-      const perVenue = venues.map((venue) => ({
-        venue: venue.name,
-        venueId: venue.id,
-        slots: slotsOnDate(getCachedSummary(activityId, venue.id) || [], other),
-        error: null,
-      }));
-      putCachedDay(
-        activityId,
-        other,
-        {
-          activityId,
-          date: other,
-          generatedAt,
-          cached: true,
-          venues: [],
-          grid: gridFromVenues(perVenue, other),
-          errors: [],
-          unparsed: false,
-          venueCount: venues.length,
-        },
-        expiresAt
-      );
-    }
-  }
-
   function gridFromVenues(perVenue, date) {
     const grid = {};
     for (const row of perVenue) {
-      const slots = mergeSlotsForDate(row.slots, date);
+      const slots = mergeSlotsForDate(row.slots, date).filter((slot) => slot.count > 0);
       if (!slots.length) continue;
       for (const slot of slots) {
         grid[slot.label] ??= {};
@@ -1064,30 +1132,29 @@
   }
 
   async function getAvailability(activityId, date, onProgress) {
-    resetSlotFetchIfNeeded(activityId);
     const cachedDay = getCachedDay(activityId, date);
     if (cachedDay) return cachedDay;
 
-    lastRawSample = null;
+    lastDebug = null;
     const venues = await getVenues(activityId);
     const perVenue = await fetchSlotsForDate(venues, activityId, date, onProgress);
     const errors = perVenue.filter((v) => v.error).map((v) => ({ venue: v.venue, error: v.error }));
-    const unparsed = perVenue.every((v) => v.slots.length === 0) && lastRawSample;
+    const grid = gridFromVenues(perVenue, date);
     const generatedAt = new Date().toISOString();
-    const expiresAt = Date.now() + CACHE_TTL_MS;
     const value = {
       activityId,
       date,
       generatedAt,
       cached: false,
       venues: [],
-      grid: gridFromVenues(perVenue, date),
+      grid,
       errors,
-      unparsed,
+      unparsed: Object.keys(grid).length === 0 ? lastDebug : null,
       venueCount: venues.length,
     };
-    putCachedDay(activityId, date, { ...value, cached: true }, expiresAt);
-    warmOtherDaysFromSummary(activityId, date, venues);
+    if (slotSourceByActivity.has(activityId) || Object.keys(grid).length) {
+      putCachedDay(activityId, date, { ...value, cached: true }, Date.now() + CACHE_TTL_MS);
+    }
     return value;
   }
 
@@ -1398,11 +1465,18 @@
       }
 
       if (times.length === 0) {
-        frag.appendChild(p('empty', 'No instant booking slots at any venue on this day.'));
+        frag.appendChild(
+          p(
+            'empty',
+            slotSourceByActivity.has(activityId)
+              ? 'No instant booking slots at any venue on this day.'
+              : 'Could not find ActiveSG’s Instant times API. Open Instant booking, pick any venue and a date so times load, then click Clear cache.'
+          )
+        );
         if (data.unparsed) {
           const details = document.createElement('details');
           const summary = document.createElement('summary');
-          summary.textContent = 'Raw API sample (paste this back if this looks wrong)';
+          summary.textContent = 'Debug (paste this back if times are still missing)';
           const pre = document.createElement('pre');
           pre.textContent = JSON.stringify(data.unparsed, null, 2);
           details.append(summary, pre);
