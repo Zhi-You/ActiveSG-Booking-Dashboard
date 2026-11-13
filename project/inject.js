@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ActiveSG Booking Dashboard
 // @namespace    local.activesg.dashboard
-// @version      2.6.1
+// @version      2.7.0
 // @description  Read-only time × venue grid on ActiveSG after you log in. Never books anything.
 // @match        https://activesg.gov.sg/*
 // @grant        none
@@ -1158,6 +1158,196 @@
     return value;
   }
 
+  const SUMMARY_PROCEDURE = 'schedule.getAvailabilitySummary';
+  const ballotCache = new Map();
+  let activitiesPromise = null;
+
+  function getActivitiesCached() {
+    if (!activitiesPromise) {
+      activitiesPromise = getActivities().catch((err) => {
+        activitiesPromise = null;
+        throw err;
+      });
+    }
+    return activitiesPromise;
+  }
+
+  function inSingapore(lat, lng) {
+    return lat > 1.13 && lat < 1.49 && lng > 103.57 && lng < 104.13;
+  }
+
+  function finiteNumber(value) {
+    const n = typeof value === 'string' ? Number(value) : value;
+    return typeof n === 'number' && Number.isFinite(n) ? n : null;
+  }
+
+  function venueLocation(raw) {
+    const out = { lat: null, lng: null, address: null, postal: null };
+    const seen = new Set();
+
+    function walk(node, depth) {
+      if (!node || typeof node !== 'object' || depth > 4 || seen.has(node)) return;
+      seen.add(node);
+      if (Array.isArray(node)) {
+        if (node.length === 2 && out.lat == null) {
+          const a = finiteNumber(node[0]);
+          const b = finiteNumber(node[1]);
+          if (a != null && b != null) {
+            if (inSingapore(b, a)) {
+              out.lat = b;
+              out.lng = a;
+            } else if (inSingapore(a, b)) {
+              out.lat = a;
+              out.lng = b;
+            }
+          }
+        }
+        node.slice(0, 10).forEach((child) => walk(child, depth + 1));
+        return;
+      }
+      if (out.lat == null) {
+        const lat = finiteNumber(pick(node, ['latitude', 'lat', 'Latitude', 'LATITUDE']));
+        const lng = finiteNumber(pick(node, ['longitude', 'lng', 'lon', 'long', 'Longitude', 'LONGITUDE']));
+        if (lat != null && lng != null && inSingapore(lat, lng)) {
+          out.lat = lat;
+          out.lng = lng;
+        }
+      }
+      if (!out.postal) {
+        const postal = pick(node, ['postalCode', 'postal_code', 'postal', 'postcode', 'zipCode']);
+        if (postal != null && /^\d{6}$/.test(String(postal).trim())) out.postal = String(postal).trim();
+      }
+      if (!out.address) {
+        const address = pick(node, ['address', 'fullAddress', 'formattedAddress', 'addressLine1', 'streetAddress', 'street']);
+        if (typeof address === 'string' && address.trim()) {
+          out.address = address.trim();
+        } else if (address && typeof address === 'object' && !Array.isArray(address)) {
+          const text = Object.values(address)
+            .filter((part) => typeof part === 'string' && part.trim())
+            .join(', ');
+          if (text) out.address = text;
+        }
+      }
+      for (const value of Object.values(node)) {
+        if (value && typeof value === 'object') walk(value, depth + 1);
+      }
+    }
+
+    walk(raw, 0);
+    if (!out.postal && out.address) {
+      const match = out.address.match(/\b(\d{6})\b/);
+      if (match) out.postal = match[1];
+    }
+    return out;
+  }
+
+  function describeInstantTime(value) {
+    if (value == null || value === '') return null;
+    const start =
+      typeof value === 'object' && !Array.isArray(value)
+        ? pick(value, ['startTime', 'start', 'startsAt', 'startAt', 'datetime', 'date'])
+        : value;
+    const date = asDateKey(start);
+    const time = formatHmIfTime(start);
+    if (!date) return null;
+    const parts = dateCardParts(date);
+    return time ? `${parts.dow} ${parts.rest}, ${displayTime(time)}` : `${parts.dow} ${parts.rest}`;
+  }
+
+  function summarizeBallot(data) {
+    if (!data || typeof data !== 'object') return { ballotStatus: null, ballotable: false, nextInstant: null };
+    const raw = data.ballotAvailability;
+    let status = null;
+    if (raw != null) {
+      status =
+        typeof raw === 'object'
+          ? String(pick(raw, ['status', 'state', 'availability']) ?? JSON.stringify(raw))
+          : String(raw);
+    }
+    const ballotable = status != null && !/^(unavailable|not_available|none|closed|false|)$/i.test(status.trim());
+    return { ballotStatus: status, ballotable, nextInstant: describeInstantTime(data.nextInstantTimeslot) };
+  }
+
+  async function getBallotSummary(activityId) {
+    const cached = ballotCache.get(activityId);
+    if (cached && Date.now() < cached.expiresAt) return cached.byVenue;
+    const venues = await getVenues(activityId);
+    const byVenue = {};
+    for (let i = 0; i < venues.length; i += BATCH_SIZE) {
+      const chunk = venues.slice(i, i + BATCH_SIZE);
+      const inputs = chunk.map((venue) => ({ venueId: venue.id, activityId }));
+      let payloads;
+      try {
+        payloads = await trpcBatch(SUMMARY_PROCEDURE, inputs);
+      } catch (err) {
+        if (isAuthError(err)) throw err;
+        payloads = await mapWithConcurrency(inputs, FANOUT, async (input) => {
+          try {
+            return await trpcGet(SUMMARY_PROCEDURE, input);
+          } catch (inner) {
+            if (isAuthError(inner)) throw inner;
+            return null;
+          }
+        });
+      }
+      chunk.forEach((venue, j) => {
+        byVenue[venue.id] = summarizeBallot(payloads[j]);
+      });
+    }
+    ballotCache.set(activityId, { byVenue, expiresAt: Date.now() + CACHE_TTL_MS });
+    return byVenue;
+  }
+
+  async function instantByVenue(activityId, date) {
+    const data = await getAvailability(activityId, date);
+    const byVenue = {};
+    for (const label of Object.keys(data.grid).sort()) {
+      for (const cell of Object.values(data.grid[label])) {
+        if (!cell || cell.count <= 0) continue;
+        (byVenue[cell.venueId] ??= []).push({ label, time: displayTime(label), count: cell.count });
+      }
+    }
+    return {
+      byVenue,
+      sourceFound: Boolean(data.cached || slotSourceByActivity.has(activityId) || Object.keys(data.grid).length),
+      generatedAt: data.generatedAt,
+      cached: Boolean(data.cached),
+      errors: data.errors,
+    };
+  }
+
+  async function handleMapRequest(msg) {
+    switch (msg.type) {
+      case 'asg:map:init':
+        return { sports: await getActivitiesCached(), prefs: loadPrefs(), days: dateWindow() };
+      case 'asg:map:venues': {
+        const venues = await getVenues(msg.activityId);
+        return venues.map((venue) => ({ id: venue.id, name: venue.name, ...venueLocation(venue.raw) }));
+      }
+      case 'asg:map:instant':
+        return instantByVenue(msg.activityId, msg.date);
+      case 'asg:map:ballot':
+        return getBallotSummary(msg.activityId);
+      case 'asg:map:url':
+        return bookingUrl(msg.activityId, msg.venueId, msg.date || todayStr());
+      default:
+        throw new Error(`Unknown map request ${msg.type}`);
+    }
+  }
+
+  const extensionRuntime = typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.id ? chrome.runtime : null;
+
+  if (extensionRuntime?.onMessage) {
+    extensionRuntime.onMessage.addListener((msg, _sender, sendResponse) => {
+      if (!msg || typeof msg.type !== 'string' || !msg.type.startsWith('asg:map:')) return false;
+      handleMapRequest(msg).then(
+        (data) => sendResponse({ ok: true, data }),
+        (err) => sendResponse({ ok: false, error: humanError(err), auth: isAuthError(err) })
+      );
+      return true;
+    });
+  }
+
   function addDaysIso(iso, days) {
     const date = new Date(`${iso}T12:00:00+08:00`);
     date.setDate(date.getDate() + days);
@@ -1226,6 +1416,12 @@
     }
     .chrome { flex: 1; min-height: 0; display: flex; flex-direction: column; }
     .top { padding: 20px 20px 0; }
+    .top-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .map-btn {
+      border: 1px solid #e5e5e5; border-radius: 999px; background: #fff; color: #111;
+      padding: 8px 16px; font-size: 14px; font-weight: 600; cursor: pointer;
+    }
+    .map-btn:hover { border-color: #111; }
     .instant {
       display: inline-flex; align-items: center; gap: 8px;
       background: #111; color: #fff; border-radius: 999px; padding: 8px 14px 8px 10px;
@@ -1303,16 +1499,19 @@
     resizer.className = 'resizer';
     resizer.title = 'Drag to resize';
     panel.appendChild(resizer);
-    const chrome = document.createElement('div');
-    chrome.className = 'chrome';
-    chrome.innerHTML = `
+    const shell = document.createElement('div');
+    shell.className = 'chrome';
+    shell.innerHTML = `
       <div class="top">
-        <div class="instant">
-          <svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true">
-            <circle cx="12" cy="12" r="10" fill="none" stroke="white" stroke-width="1.8"/>
-            <path d="M13 4.5L7.5 13h4.2L11 19.5 16.5 11h-4.2L13 4.5z" fill="white"/>
-          </svg>
-          Instant
+        <div class="top-row">
+          <div class="instant">
+            <svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="12" cy="12" r="10" fill="none" stroke="white" stroke-width="1.8"/>
+              <path d="M13 4.5L7.5 13h4.2L11 19.5 16.5 11h-4.2L13 4.5z" fill="white"/>
+            </svg>
+            Instant
+          </div>
+          <button type="button" class="map-btn" id="open-map" title="Open venues on a Singapore map in a new tab">Map</button>
         </div>
         <div class="sport-row">
           <label>Sport<select id="sport"></select></label>
@@ -1326,7 +1525,7 @@
       </div>
       <div class="body" id="body"><p class="empty">Log into ActiveSG, then pick a day.</p></div>
     `;
-    panel.appendChild(chrome);
+    panel.appendChild(shell);
 
     wrap.append(toggle, panel);
     shadow.append(style, wrap);
@@ -1515,6 +1714,23 @@
         frag.appendChild(card);
       }
       bodyEl.replaceChildren(frag);
+    }
+
+    const mapBtn = panel.querySelector('#open-map');
+    if (!extensionRuntime) {
+      mapBtn.hidden = true;
+    } else {
+      mapBtn.addEventListener('click', () => {
+        const reloaded = () =>
+          bodyEl.replaceChildren(p('error', 'The extension was reloaded. Refresh this tab, then click Map again.'));
+        try {
+          Promise.resolve(
+            extensionRuntime.sendMessage({ type: 'asg:open-map', sport: sportEl.value, date: selectedDate })
+          ).catch(reloaded);
+        } catch {
+          reloaded();
+        }
+      });
     }
 
     sportEl.addEventListener('change', loadDay);

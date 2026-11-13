@@ -1,0 +1,131 @@
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { height: 100%; margin: 0; }
+body {
+  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; color: #111; background: #fff;
+  display: flex; flex-direction: column;
+}
+button { font: inherit; }
+
+.bar {
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  padding: 12px 20px; border-bottom: 1px solid #ececec;
+}
+.bar h1 { margin: 0; font-size: 18px; font-weight: 700; }
+.sport { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #666; }
+select {
+  appearance: none; background: #fff; border: 1px solid #e5e5e5; border-radius: 10px;
+  padding: 8px 12px; font-size: 14px; color: #111; min-width: 160px;
+}
+.modes { display: inline-flex; background: #f3f3f3; border-radius: 999px; padding: 4px; }
+.modes button {
+  border: 0; background: transparent; border-radius: 999px; padding: 7px 14px;
+  font-size: 14px; font-weight: 600; color: #555; cursor: pointer;
+}
+.modes button.active { background: #111; color: #fff; }
+.modes button:disabled { cursor: default; opacity: 0.5; }
+.check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #444; cursor: pointer; }
+
+.dates {
+  display: flex; gap: 8px; overflow-x: auto; padding: 10px 20px; border-bottom: 1px solid #ececec;
+  scrollbar-width: thin;
+}
+.date-card {
+  flex: 0 0 72px; height: 60px; border: 1px solid #e8e8e8; border-radius: 12px; background: #fff;
+  cursor: pointer; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 2px; color: #111;
+}
+.date-card .dow { font-weight: 700; font-size: 14px; }
+.date-card .rest { font-size: 12px; color: #555; }
+.date-card.selected { border: 2px solid #111; background: #fafafa; }
+
+.layout { flex: 1; min-height: 0; display: flex; }
+.side {
+  width: 340px; flex: 0 0 340px; border-right: 1px solid #ececec; display: flex; flex-direction: column;
+  min-height: 0;
+}
+.status { margin: 0; padding: 12px 16px; font-size: 13px; color: #555; border-bottom: 1px solid #f0f0f0; }
+.status.error { color: #b91c1c; }
+.actions { display: flex; gap: 8px; padding: 10px 16px; border-bottom: 1px solid #f0f0f0; }
+.actions button, .popup .open {
+  border: 1px solid #111; background: #111; color: #fff; border-radius: 999px; padding: 6px 14px;
+  font-size: 13px; font-weight: 600; cursor: pointer;
+}
+.actions button.secondary { background: #fff; color: #111; border-color: #ddd; }
+
+.list { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; }
+.item { padding: 10px 16px; border-bottom: 1px solid #f3f3f3; cursor: pointer; }
+.item:hover { background: #fafafa; }
+.item.selected { background: #f4f4f4; box-shadow: inset 3px 0 0 #111; }
+.item .name { font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.item .detail { font-size: 12px; color: #666; margin-top: 3px; }
+.item .unplaced { font-size: 11px; color: #b45309; font-weight: 500; }
+.swatch { width: 10px; height: 10px; border-radius: 50%; flex: 0 0 10px; }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.chip {
+  border: 1px solid #d1e7d9; background: #f0faf3; color: #166534; border-radius: 999px;
+  padding: 2px 8px; font-size: 12px; cursor: pointer;
+}
+.chip:hover { border-color: #166534; }
+
+.map { position: relative; flex: 1; overflow: hidden; background: #e8eef1; cursor: grab; touch-action: none; }
+.map.dragging { cursor: grabbing; }
+.tiles, .markers { position: absolute; inset: 0; }
+.tiles img {
+  position: absolute; left: 0; top: 0; width: 256px; height: 256px; user-select: none;
+  -webkit-user-drag: none; pointer-events: none;
+}
+
+.marker { position: absolute; left: 0; top: 0; width: 0; height: 0; cursor: pointer; white-space: nowrap; }
+.marker .dot {
+  position: absolute; left: 0; top: 0; transform: translate(-50%, -50%);
+  min-width: 16px; height: 16px; border-radius: 999px; border: 2px solid #fff;
+  box-shadow: 0 1px 4px rgb(0 0 0 / 35%); display: flex; align-items: center; justify-content: center;
+  color: #fff; font-size: 11px; font-weight: 700; padding: 0 4px;
+}
+.marker .label {
+  position: absolute; left: 14px; top: 0; transform: translateY(-50%);
+  display: none; background: rgb(255 255 255 / 92%); border-radius: 6px; padding: 2px 6px;
+  font-size: 12px; font-weight: 600; box-shadow: 0 1px 3px rgb(0 0 0 / 20%);
+}
+.map.show-labels .marker:not(.muted) .label { display: block; }
+.marker:hover .label { display: block; }
+.marker.venue .dot { background: #1d4ed8; }
+.marker.slots .dot { background: #16a34a; min-width: 22px; height: 22px; }
+.marker.ballot .dot { background: #7c3aed; }
+.marker.muted .dot { background: #9ca3af; min-width: 10px; height: 10px; padding: 0; border-width: 1.5px; }
+.marker.selected .dot { outline: 3px solid #111; outline-offset: 1px; }
+.marker.selected { z-index: 5; }
+
+.popup {
+  position: absolute; left: 0; top: 0; z-index: 10; width: 280px; background: #fff; border-radius: 12px;
+  box-shadow: 0 8px 28px rgb(0 0 0 / 22%); padding: 12px 14px; cursor: default;
+}
+.popup .close {
+  position: absolute; top: 6px; right: 8px; border: 0; background: none; font-size: 18px; color: #888;
+  cursor: pointer;
+}
+.popup h2 { margin: 0 20px 4px 0; font-size: 15px; }
+.popup .address { font-size: 12px; color: #666; margin: 0 0 8px; }
+.popup .note { font-size: 12px; color: #444; margin: 0 0 8px; }
+.popup .approx { font-size: 11px; color: #b45309; margin: 0 0 8px; }
+
+.zoom {
+  position: absolute; top: 12px; right: 12px; display: flex; flex-direction: column; gap: 4px; z-index: 6;
+}
+.zoom button {
+  width: 36px; height: 36px; border: 1px solid #ddd; background: #fff; border-radius: 8px;
+  font-size: 18px; font-weight: 600; cursor: pointer;
+}
+.zoom #zoom-fit { font-size: 11px; }
+.legend {
+  position: absolute; left: 12px; bottom: 12px; z-index: 6; background: rgb(255 255 255 / 95%);
+  border-radius: 10px; padding: 8px 10px; font-size: 12px; box-shadow: 0 1px 4px rgb(0 0 0 / 15%);
+  display: flex; flex-direction: column; gap: 4px;
+}
+.legend:empty { display: none; }
+.legend span { display: flex; align-items: center; gap: 6px; }
+.attribution {
+  position: absolute; right: 8px; bottom: 6px; z-index: 6; font-size: 11px; color: #333;
+  background: rgb(255 255 255 / 85%); padding: 2px 6px; border-radius: 4px; text-decoration: none;
+}

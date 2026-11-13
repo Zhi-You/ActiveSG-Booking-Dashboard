@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ActiveSG courts map</title>
+    <link rel="stylesheet" href="map.css" />
+  </head>
+  <body>
+    <header class="bar">
+      <h1>Courts map</h1>
+      <label class="sport">
+        <span>Sport</span>
+        <select id="sport" disabled></select>
+      </label>
+      <div class="modes" role="tablist" aria-label="Map mode">
+        <button type="button" role="tab" data-mode="venues">All venues</button>
+        <button type="button" role="tab" data-mode="instant">Instant slots</button>
+        <button type="button" role="tab" data-mode="ballot">Ballot</button>
+      </div>
+      <label class="check" id="show-all-wrap" hidden>
+        <input type="checkbox" id="show-all" />
+        <span>Also show other venues</span>
+      </label>
+    </header>
+    <nav class="dates" id="dates" hidden></nav>
+    <main class="layout">
+      <aside class="side">
+        <p class="status" id="status">Connecting to your ActiveSG tab…</p>
+        <div class="actions" id="actions" hidden></div>
+        <ul class="list" id="list"></ul>
+      </aside>
+      <section class="map" id="map" aria-label="Singapore map">
+        <div class="tiles" id="tiles"></div>
+        <div class="markers" id="markers"></div>
+        <div class="popup" id="popup" hidden></div>
+        <div class="zoom">
+          <button type="button" id="zoom-in" title="Zoom in">+</button>
+          <button type="button" id="zoom-out" title="Zoom out">−</button>
+          <button type="button" id="zoom-fit" title="Fit all markers">Fit</button>
+        </div>
+        <div class="legend" id="legend"></div>
+        <a class="attribution" href="https://www.onemap.gov.sg/" target="_blank" rel="noopener noreferrer">
+          OneMap · © Singapore Land Authority
+        </a>
+      </section>
+    </main>
+    <script src="map.js"></script>
+  </body>
+</html>
